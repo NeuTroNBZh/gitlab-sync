@@ -66,7 +66,7 @@ jobs:
 
           while IFS='|' read -r PROJECT_ID PROJECT_NAME NAMESPACE; do
             COMMITS=$(curl -sf --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
-              "$GITLAB_BASE/api/v4/projects/$PROJECT_ID/repository/commits?author=$GITLAB_USER&since=$SINCE&per_page=100&with_stats=true" \
+              "$GITLAB_BASE/api/v4/projects/$PROJECT_ID/repository/commits?author=$GITLAB_USER&since=$SINCE&per_page=100&with_stats=true&all=true" \
               2>/dev/null || echo "[]")
 
             COUNT=$(echo "$COMMITS" | jq 'length')
