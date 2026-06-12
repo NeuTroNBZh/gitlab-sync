@@ -1,4 +1,4 @@
-name: Sync GitLab Commits
+name: Sync GitLab Commits to GitHub
 
 on:
   schedule:
