@@ -1,0 +1,137 @@
+name: Sync GitLab Commits
+
+on:
+  schedule:
+    # Toutes les heures en semaine (7h–22h UTC)
+    - cron: '0 7-22 * * 1-5'
+    # 2x par jour le week-end
+    - cron: '0 10,18 * * 0,6'
+  workflow_dispatch:
+    inputs:
+      retroactive_days:
+        description: 'Remonter X jours en arrière (0 = sync normal)'
+        required: false
+        default: '0'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Setup Git
+        run: |
+          git config user.name "${{ secrets.GIT_NAME }}"
+          git config user.email "${{ secrets.GIT_EMAIL }}"
+
+      - name: Install dependencies
+        run: sudo apt-get install -y jq
+
+      - name: Fetch & sync GitLab commits
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          GITLAB_USER: ${{ secrets.GITLAB_USER }}
+          GITLAB_URL: ${{ secrets.GITLAB_URL }}
+          LAST_SYNC_FILE: .last_sync
+          RETROACTIVE_DAYS: ${{ github.event.inputs.retroactive_days || '0' }}
+        run: |
+          GITLAB_BASE="${GITLAB_URL:-https://gitlab.com}"
+
+          # ── Détermine la date de départ ───────────────────────────────
+          if [ "$RETROACTIVE_DAYS" -gt 0 ]; then
+            SINCE=$(date -u -d "${RETROACTIVE_DAYS} days ago" '+%Y-%m-%dT%H:%M:%SZ')
+            echo "🕰️  Mode rétroactif : remonte $RETROACTIVE_DAYS jours ($SINCE)"
+          elif [ -f "$LAST_SYNC_FILE" ]; then
+            SINCE=$(cat "$LAST_SYNC_FILE")
+            echo "🔍 Sync normal depuis : $SINCE"
+          else
+            SINCE=$(date -u -d '7 days ago' '+%Y-%m-%dT%H:%M:%SZ')
+            echo "🆕 Premier lancement, remonte 7 jours ($SINCE)"
+          fi
+
+          # ── Récupère tous les projets de l'utilisateur ────────────────
+          echo "📡 Récupération des projets GitLab..."
+          PROJECTS=$(curl -sf --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+            "$GITLAB_BASE/api/v4/projects?membership=true&per_page=100" \
+            | jq -r '.[] | "\(.id)|\(.name)|\(.namespace.name)"')
+
+          if [ -z "$PROJECTS" ]; then
+            echo "❌ Impossible de récupérer les projets. Vérifie GITLAB_TOKEN et GITLAB_URL."
+            exit 1
+          fi
+
+          # ── Collecte les commits avec leurs métadonnées ───────────────
+          declare -A COMMIT_DATA  # clé = date ISO, valeur = message formaté
+          COMMIT_COUNT=0
+
+          while IFS='|' read -r PROJECT_ID PROJECT_NAME NAMESPACE; do
+            # Commits de l'auteur sur ce projet depuis SINCE
+            COMMITS=$(curl -sf --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+              "$GITLAB_BASE/api/v4/projects/$PROJECT_ID/repository/commits?author=$GITLAB_USER&since=$SINCE&per_page=100&with_stats=true" \
+              2>/dev/null || echo "[]")
+
+            COUNT=$(echo "$COMMITS" | jq 'length')
+            [ "$COUNT" -eq 0 ] && continue
+
+            echo "  → $NAMESPACE/$PROJECT_NAME : $COUNT commit(s)"
+
+            # Parcourt chaque commit
+            while IFS= read -r COMMIT_JSON; do
+              DATE=$(echo "$COMMIT_JSON"    | jq -r '.authored_date')
+              MSG=$(echo "$COMMIT_JSON"     | jq -r '.title' | head -c 72)
+              SHORT_ID=$(echo "$COMMIT_JSON" | jq -r '.short_id')
+              ADDITIONS=$(echo "$COMMIT_JSON" | jq -r '.stats.additions // 0')
+              DELETIONS=$(echo "$COMMIT_JSON" | jq -r '.stats.deletions // 0')
+              FILES=$(echo "$COMMIT_JSON"   | jq -r '.stats.total // 0')
+
+              # Formate le message du commit fantôme
+              GHOST_MSG=$(cat <<EOF
+${MSG}
+
+[gitlab-sync]
+  project  : ${NAMESPACE}/${PROJECT_NAME}
+  commit   : ${SHORT_ID}
+  changes  : +${ADDITIONS} / -${DELETIONS} lines across ${FILES} file(s)
+EOF
+)
+              # Stocke avec la date comme clé pour le tri
+              COMMIT_DATA["$DATE"]="$GHOST_MSG"
+              COMMIT_COUNT=$((COMMIT_COUNT + 1))
+            done < <(echo "$COMMITS" | jq -c '.[]')
+
+          done <<< "$PROJECTS"
+
+          echo ""
+          echo "📦 Total : $COMMIT_COUNT commit(s) à synchroniser"
+
+          if [ $COMMIT_COUNT -eq 0 ]; then
+            echo "✅ Rien de nouveau à synchroniser."
+            exit 0
+          fi
+
+          # ── Crée les commits fantômes triés par date ──────────────────
+          PUSHED=0
+          for DATE in $(echo "${!COMMIT_DATA[@]}" | tr ' ' '\n' | sort); do
+            MSG="${COMMIT_DATA[$DATE]}"
+            export GIT_AUTHOR_DATE="$DATE"
+            export GIT_COMMITTER_DATE="$DATE"
+            git commit --allow-empty -m "$MSG"
+            PUSHED=$((PUSHED + 1))
+          done
+
+          # ── Met à jour le timestamp de dernier sync ───────────────────
+          NEW_SYNC=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          echo "$NEW_SYNC" > "$LAST_SYNC_FILE"
+          git add "$LAST_SYNC_FILE"
+          export GIT_AUTHOR_DATE=""
+          export GIT_COMMITTER_DATE=""
+          git commit -m "chore: last sync at $NEW_SYNC"
+
+          git push origin HEAD
+          echo ""
+          echo "🚀 $PUSHED commit(s) synchronisé(s) avec succès !"
